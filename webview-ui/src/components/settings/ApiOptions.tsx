@@ -87,6 +87,12 @@ declare module "vscode" {
 
 const ApiOptions = ({ showModelOptions, apiErrorMessage, modelIdErrorMessage, isPopup }: ApiOptionsProps) => {
 	const { apiConfiguration, setApiConfiguration, uriScheme } = useExtensionState()
+	const [retrySettings, setRetrySettings] = useState({
+		maxRetries: apiConfiguration?.maxRetries || 3,
+		baseDelay: apiConfiguration?.baseDelay || 1000,
+		maxDelay: apiConfiguration?.maxDelay || 10000,
+		retryAllErrors: apiConfiguration?.retryAllErrors || false,
+	})
 	const [ollamaModels, setOllamaModels] = useState<string[]>([])
 	const [lmStudioModels, setLmStudioModels] = useState<string[]>([])
 	const [vsCodeLmModels, setVsCodeLmModels] = useState<vscodemodels.LanguageModelChatSelector[]>([])
@@ -98,10 +104,22 @@ const ApiOptions = ({ showModelOptions, apiErrorMessage, modelIdErrorMessage, is
 	const [providerSortingSelected, setProviderSortingSelected] = useState(!!apiConfiguration?.openRouterProviderSorting)
 
 	const handleInputChange = (field: keyof ApiConfiguration) => (event: any) => {
-		setApiConfiguration({
-			...apiConfiguration,
-			[field]: event.target.value,
-		})
+		if (field === "maxRetries" || field === "baseDelay" || field === "maxDelay") {
+			const value = Number(event.target.value)
+			setRetrySettings({
+				...retrySettings,
+				[field]: value,
+			})
+			setApiConfiguration({
+				...apiConfiguration,
+				[field]: value, // Store as number in configuration
+			})
+		} else {
+			setApiConfiguration({
+				...apiConfiguration,
+				[field]: event.target.value,
+			})
+		}
 	}
 
 	const { selectedProvider, selectedModelId, selectedModelInfo } = useMemo(() => {
@@ -214,6 +232,47 @@ const ApiOptions = ({ showModelOptions, apiErrorMessage, modelIdErrorMessage, is
 					<VSCodeOption value="sambanova">SambaNova</VSCodeOption>
 				</VSCodeDropdown>
 			</DropdownContainer>
+
+			<div style={{ marginTop: 10 }}>
+				<h3 style={{ fontWeight: 500 }}>Retry Settings</h3>
+				<VSCodeTextField
+					value={retrySettings.maxRetries.toString()}
+					onInput={handleInputChange("maxRetries")}
+					placeholder="Enter max retries (e.g., 3)"
+					style={{ width: "100%", marginBottom: 5 }}>
+					<span style={{ fontWeight: 500 }}>Max Retries</span>
+				</VSCodeTextField>
+				<VSCodeTextField
+					value={retrySettings.baseDelay.toString()}
+					onInput={handleInputChange("baseDelay")}
+					placeholder="Enter base delay in ms (e.g., 1000)"
+					style={{ width: "100%", marginBottom: 5 }}>
+					<span style={{ fontWeight: 500 }}>Base Delay (ms)</span>
+				</VSCodeTextField>
+				<VSCodeTextField
+					value={retrySettings.maxDelay.toString()}
+					onInput={handleInputChange("maxDelay")}
+					placeholder="Enter max delay in ms (e.g., 10000)"
+					style={{ width: "100%", marginBottom: 5 }}>
+					<span style={{ fontWeight: 500 }}>Max Delay (ms)</span>
+				</VSCodeTextField>
+				<VSCodeCheckbox
+					checked={retrySettings.retryAllErrors}
+					onChange={(e: any) => {
+						const isChecked = e.target.checked === true
+						const newSettings = {
+							...retrySettings,
+							retryAllErrors: isChecked,
+						}
+						setRetrySettings(newSettings)
+						setApiConfiguration({
+							...apiConfiguration,
+							retryAllErrors: isChecked,
+						})
+					}}>
+					<span style={{ fontWeight: 500 }}>すべてのエラーをリトライ対象にする</span>
+				</VSCodeCheckbox>
+			</div>
 
 			{selectedProvider === "cline" && (
 				<div style={{ marginBottom: 14, marginTop: 4 }}>
