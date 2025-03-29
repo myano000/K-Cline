@@ -6,6 +6,7 @@ import { ApiStream } from "../transform/stream"
 import { convertToVsCodeLmMessages } from "../transform/vscode-lm-format"
 import { SELECTOR_SEPARATOR, stringifyVsCodeLmModelSelector } from "../../shared/vsCodeSelectorUtils"
 import { ApiHandlerOptions, ModelInfo, openAiModelInfoSaneDefaults } from "../../shared/api"
+import { withRetry } from "../retry"
 
 // Cline does not update VSCode type definitions or engine requirements to maintain compatibility.
 // This declaration (as seen in src/integrations/TerminalManager.ts) provides types for the Language Model API in newer versions of VSCode.
@@ -225,6 +226,159 @@ export class VsCodeLmHandler implements ApiHandler, SingleCompletionHandler {
 	 * converts the messages to VS Code LM format, and streams the response chunks.
 	 * Tool calls handling is currently a work in progress.
 	 */
+	@withRetry({
+		maxRetries: 3,
+		baseDelay: 1000,
+		maxDelay: 10000,
+		showNotification: true,
+	})
+	async *createMessage(systemPrompt: string, messages: Anthropic.Messages.MessageParam[]): ApiStream {
+		// Ensure clean state before starting a new request
+		this.ensureCleanState()
+		const client: vscode.LanguageModelChat = await this.getClient()
+
+		// Clean system prompt and messages
+		const cleanedSystemPrompt = this.cleanTerminalOutput(systemPrompt)
+		const cleanedMessages = messages.map((msg) => ({
+			...msg,
+			content: this.cleanMessageContent(msg.content),
+		}))
+
+		// Convert Anthropic messages to VS Code LM messages
+		const vsCodeLmMessages: vscode.LanguageModelChatMessage[] = [
+			vscode.LanguageModelChatMessage.Assistant(cleanedSystemPrompt),
+			...convertToVsCodeLmMessages(cleanedMessages),
+		]
+
+		// Initialize cancellation token for the request
+		this.currentRequestCancellation = new vscode.CancellationTokenSource()
+
+		// Calculate input tokens before starting the stream
+		const totalInputTokens: number = await this.calculateTotalInputTokens(systemPrompt, vsCodeLmMessages)
+
+		// Accumulate the text and count at the end of the stream to reduce token counting overhead.
+		let accumulatedText: string = ""
+
+		try {
+			// Create the response stream with minimal required options
+			const requestOptions: vscode.LanguageModelChatRequestOptions = {
+				justification: `Cline would like to use '${client.name}' from '${client.vendor}', Click 'Allow' to proceed.`,
+			}
+
+			// Note: Tool support is currently provided by the VSCode Language Model API directly
+			// Extensions can register tools using vscode.lm.registerTool()
+
+			const response: vscode.LanguageModelChatResponse = await client.sendRequest(
+				vsCodeLmMessages,
+				requestOptions,
+				this.currentRequestCancellation.token,
+			)
+
+			// Consume the stream and handle both text and tool call chunks
+			for await (const chunk of response.stream) {
+				if (chunk instanceof vscode.LanguageModelTextPart) {
+					// Validate text part value
+					if (typeof chunk.value !== "string") {
+						console.warn("Cline <Language Model API>: Invalid text part value received:", chunk.value)
+						continue
+					}
+
+					accumulatedText += chunk.value
+					yield {
+						type: "text",
+						text: chunk.value,
+					}
+				} else if (chunk instanceof vscode.LanguageModelToolCallPart) {
+					try {
+						// Validate tool call parameters
+						if (!chunk.name || typeof chunk.name !== "string") {
+							console.warn("Cline <Language Model API>: Invalid tool name received:", chunk.name)
+							continue
+						}
+
+						if (!chunk.callId || typeof chunk.callId !== "string") {
+							console.warn("Cline <Language Model API>: Invalid tool callId received:", chunk.callId)
+							continue
+						}
+
+						// Ensure input is a valid object
+						if (!chunk.input || typeof chunk.input !== "object") {
+							console.warn("Cline <Language Model API>: Invalid tool input received:", chunk.input)
+							continue
+						}
+
+						// Convert tool calls to text format with proper error handling
+						const toolCall = {
+							type: "tool_call",
+							name: chunk.name,
+							arguments: chunk.input,
+							callId: chunk.callId,
+						}
+
+						const toolCallText = JSON.stringify(toolCall)
+						accumulatedText += toolCallText
+
+						// Log tool call for debugging
+						console.debug("Cline <Language Model API>: Processing tool call:", {
+							name: chunk.name,
+							callId: chunk.callId,
+							inputSize: JSON.stringify(chunk.input).length,
+						})
+
+						yield {
+							type: "text",
+							text: toolCallText,
+						}
+					} catch (error) {
+						console.error("Cline <Language Model API>: Failed to process tool call:", error)
+						// Continue processing other chunks even if one fails
+						continue
+					}
+				} else {
+					console.warn("Cline <Language Model API>: Unknown chunk type received:", chunk)
+				}
+			}
+
+			// Count tokens in the accumulated text after stream completion
+			const totalOutputTokens: number = await this.countTokens(accumulatedText)
+
+			// Report final usage after stream completion
+			yield {
+				type: "usage",
+				inputTokens: totalInputTokens,
+				outputTokens: totalOutputTokens,
+				totalCost: calculateApiCostAnthropic(this.getModel().info, totalInputTokens, totalOutputTokens),
+			}
+		} catch (error: unknown) {
+			this.ensureCleanState()
+
+			if (error instanceof vscode.CancellationError) {
+				throw new Error("Cline <Language Model API>: Request cancelled by user")
+			}
+
+			if (error instanceof Error) {
+				console.error("Cline <Language Model API>: Stream error details:", {
+					message: error.message,
+					stack: error.stack,
+					name: error.name,
+				})
+
+				// Return original error if it's already an Error instance
+				throw error
+			} else if (typeof error === "object" && error !== null) {
+				// Handle error-like objects
+				const errorDetails = JSON.stringify(error, null, 2)
+				console.error("Cline <Language Model API>: Stream error object:", errorDetails)
+				throw new Error(`Cline <Language Model API>: Response stream error: ${errorDetails}`)
+			} else {
+				// Fallback for unknown error types
+				const errorMessage = String(error)
+				console.error("Cline <Language Model API>: Unknown stream error:", errorMessage)
+				throw new Error(`Cline <Language Model API>: Response stream error: ${errorMessage}`)
+			}
+		}
+	}
+
 	dispose(): void {
 		if (this.disposable) {
 			this.disposable.dispose()
@@ -408,153 +562,6 @@ export class VsCodeLmHandler implements ApiHandler, SingleCompletionHandler {
 		}
 
 		return content
-	}
-
-	async *createMessage(systemPrompt: string, messages: Anthropic.Messages.MessageParam[]): ApiStream {
-		// Ensure clean state before starting a new request
-		this.ensureCleanState()
-		const client: vscode.LanguageModelChat = await this.getClient()
-
-		// Clean system prompt and messages
-		const cleanedSystemPrompt = this.cleanTerminalOutput(systemPrompt)
-		const cleanedMessages = messages.map((msg) => ({
-			...msg,
-			content: this.cleanMessageContent(msg.content),
-		}))
-
-		// Convert Anthropic messages to VS Code LM messages
-		const vsCodeLmMessages: vscode.LanguageModelChatMessage[] = [
-			vscode.LanguageModelChatMessage.Assistant(cleanedSystemPrompt),
-			...convertToVsCodeLmMessages(cleanedMessages),
-		]
-
-		// Initialize cancellation token for the request
-		this.currentRequestCancellation = new vscode.CancellationTokenSource()
-
-		// Calculate input tokens before starting the stream
-		const totalInputTokens: number = await this.calculateTotalInputTokens(systemPrompt, vsCodeLmMessages)
-
-		// Accumulate the text and count at the end of the stream to reduce token counting overhead.
-		let accumulatedText: string = ""
-
-		try {
-			// Create the response stream with minimal required options
-			const requestOptions: vscode.LanguageModelChatRequestOptions = {
-				justification: `Cline would like to use '${client.name}' from '${client.vendor}', Click 'Allow' to proceed.`,
-			}
-
-			// Note: Tool support is currently provided by the VSCode Language Model API directly
-			// Extensions can register tools using vscode.lm.registerTool()
-
-			const response: vscode.LanguageModelChatResponse = await client.sendRequest(
-				vsCodeLmMessages,
-				requestOptions,
-				this.currentRequestCancellation.token,
-			)
-
-			// Consume the stream and handle both text and tool call chunks
-			for await (const chunk of response.stream) {
-				if (chunk instanceof vscode.LanguageModelTextPart) {
-					// Validate text part value
-					if (typeof chunk.value !== "string") {
-						console.warn("Cline <Language Model API>: Invalid text part value received:", chunk.value)
-						continue
-					}
-
-					accumulatedText += chunk.value
-					yield {
-						type: "text",
-						text: chunk.value,
-					}
-				} else if (chunk instanceof vscode.LanguageModelToolCallPart) {
-					try {
-						// Validate tool call parameters
-						if (!chunk.name || typeof chunk.name !== "string") {
-							console.warn("Cline <Language Model API>: Invalid tool name received:", chunk.name)
-							continue
-						}
-
-						if (!chunk.callId || typeof chunk.callId !== "string") {
-							console.warn("Cline <Language Model API>: Invalid tool callId received:", chunk.callId)
-							continue
-						}
-
-						// Ensure input is a valid object
-						if (!chunk.input || typeof chunk.input !== "object") {
-							console.warn("Cline <Language Model API>: Invalid tool input received:", chunk.input)
-							continue
-						}
-
-						// Convert tool calls to text format with proper error handling
-						const toolCall = {
-							type: "tool_call",
-							name: chunk.name,
-							arguments: chunk.input,
-							callId: chunk.callId,
-						}
-
-						const toolCallText = JSON.stringify(toolCall)
-						accumulatedText += toolCallText
-
-						// Log tool call for debugging
-						console.debug("Cline <Language Model API>: Processing tool call:", {
-							name: chunk.name,
-							callId: chunk.callId,
-							inputSize: JSON.stringify(chunk.input).length,
-						})
-
-						yield {
-							type: "text",
-							text: toolCallText,
-						}
-					} catch (error) {
-						console.error("Cline <Language Model API>: Failed to process tool call:", error)
-						// Continue processing other chunks even if one fails
-						continue
-					}
-				} else {
-					console.warn("Cline <Language Model API>: Unknown chunk type received:", chunk)
-				}
-			}
-
-			// Count tokens in the accumulated text after stream completion
-			const totalOutputTokens: number = await this.countTokens(accumulatedText)
-
-			// Report final usage after stream completion
-			yield {
-				type: "usage",
-				inputTokens: totalInputTokens,
-				outputTokens: totalOutputTokens,
-				totalCost: calculateApiCostAnthropic(this.getModel().info, totalInputTokens, totalOutputTokens),
-			}
-		} catch (error: unknown) {
-			this.ensureCleanState()
-
-			if (error instanceof vscode.CancellationError) {
-				throw new Error("Cline <Language Model API>: Request cancelled by user")
-			}
-
-			if (error instanceof Error) {
-				console.error("Cline <Language Model API>: Stream error details:", {
-					message: error.message,
-					stack: error.stack,
-					name: error.name,
-				})
-
-				// Return original error if it's already an Error instance
-				throw error
-			} else if (typeof error === "object" && error !== null) {
-				// Handle error-like objects
-				const errorDetails = JSON.stringify(error, null, 2)
-				console.error("Cline <Language Model API>: Stream error object:", errorDetails)
-				throw new Error(`Cline <Language Model API>: Response stream error: ${errorDetails}`)
-			} else {
-				// Fallback for unknown error types
-				const errorMessage = String(error)
-				console.error("Cline <Language Model API>: Unknown stream error:", errorMessage)
-				throw new Error(`Cline <Language Model API>: Response stream error: ${errorMessage}`)
-			}
-		}
 	}
 
 	// Return model information based on the current client state

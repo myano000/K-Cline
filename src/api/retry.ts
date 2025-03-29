@@ -1,8 +1,11 @@
+import { showSystemNotification } from "../integrations/notifications"
+
 interface RetryOptions {
 	maxRetries?: number
 	baseDelay?: number
 	maxDelay?: number
 	retryAllErrors?: boolean
+	showNotification?: boolean
 }
 
 const DEFAULT_OPTIONS: Required<RetryOptions> = {
@@ -10,10 +13,11 @@ const DEFAULT_OPTIONS: Required<RetryOptions> = {
 	baseDelay: 1_000,
 	maxDelay: 10_000,
 	retryAllErrors: false,
+	showNotification: true,
 }
 
 export function withRetry(options: RetryOptions = {}) {
-	const { maxRetries, baseDelay, maxDelay, retryAllErrors } = { ...DEFAULT_OPTIONS, ...options }
+	const { maxRetries, baseDelay, maxDelay, retryAllErrors, showNotification } = { ...DEFAULT_OPTIONS, ...options }
 
 	return function (_target: any, _propertyKey: string, descriptor: PropertyDescriptor) {
 		const originalMethod = descriptor.value
@@ -24,34 +28,21 @@ export function withRetry(options: RetryOptions = {}) {
 					yield* originalMethod.apply(this, args)
 					return
 				} catch (error: any) {
-					const isRateLimit = error?.status === 429
+					const isRateLimit = error?.message?.includes("rate limit") || error?.status === 429
 					const isLastAttempt = attempt === maxRetries - 1
 
 					if ((!isRateLimit && !retryAllErrors) || isLastAttempt) {
 						throw error
 					}
 
-					// Get retry delay from header or calculate exponential backoff
-					// Check various rate limit headers
-					const retryAfter =
-						error.headers?.["retry-after"] ||
-						error.headers?.["x-ratelimit-reset"] ||
-						error.headers?.["ratelimit-reset"]
+					const delay = Math.min(maxDelay, baseDelay * Math.pow(2, attempt))
 
-					let delay: number
-					if (retryAfter) {
-						// Handle both delta-seconds and Unix timestamp formats
-						const retryValue = parseInt(retryAfter, 10)
-						if (retryValue > Date.now() / 1000) {
-							// Unix timestamp
-							delay = retryValue * 1000 - Date.now()
-						} else {
-							// Delta seconds
-							delay = retryValue * 1000
-						}
-					} else {
-						// Use exponential backoff if no header
-						delay = Math.min(maxDelay, baseDelay * Math.pow(2, attempt))
+					if (showNotification) {
+						await showSystemNotification({
+							title: "Rate Limit",
+							subtitle: `リトライ ${attempt + 1}/${maxRetries}`,
+							message: `${Math.round(delay / 1000)}秒後に再試行します`,
+						})
 					}
 
 					await new Promise((resolve) => setTimeout(resolve, delay))
