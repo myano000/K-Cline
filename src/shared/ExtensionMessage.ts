@@ -168,6 +168,7 @@ export type ClineSay =
 	| "deleted_api_reqs"
 	| "clineignore_error"
 	| "checkpoint_created"
+	| "api_req_retry_delayed"
 
 export interface ClineSayTool {
 	tool:

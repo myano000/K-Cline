@@ -1,6 +1,7 @@
 import { Anthropic } from "@anthropic-ai/sdk"
 import cloneDeep from "clone-deep"
 import { setTimeout as setTimeoutPromise } from "node:timers/promises"
+import delay from "../mocks/delay"
 import fs from "fs/promises"
 import getFolderSize from "get-folder-size"
 import os from "os"
@@ -125,6 +126,7 @@ export class Cline {
 	private didAlreadyUseTool = false
 	private didCompleteReadingStream = false
 	private didAutomaticallyRetryFailedApiRequest = false
+	private lastApiRequestTime: number = 0
 
 	constructor(
 		provider: ClineProvider,
@@ -1275,7 +1277,43 @@ export class Cline {
 		return statusCode && !message.includes(statusCode.toString()) ? `${statusCode} - ${message}` : message
 	}
 
-	async *attemptApiRequest(previousApiReqIndex: number): ApiStream {
+	async *attemptApiRequest(previousApiReqIndex: number, retryAttempt: number = 0): ApiStream {
+		// Add maximum retry limit
+		const MAX_RETRIES = 5
+		if (retryAttempt >= MAX_RETRIES) {
+			await this.say(
+				"api_req_retry_delayed",
+				`Maximum retry attempts (${MAX_RETRIES}) reached. Please check your network connection or Resume Task.`,
+				undefined,
+				false,
+			)
+			throw new Error(
+				`Maximum retry attempts (${MAX_RETRIES}) reached. Please check your network connection or Resume Task.`,
+			)
+		}
+
+		let finalDelay = 0
+		let rateLimitSeconds = 0
+		// Only apply rate limiting if this isn't the first request and not retrying
+		if (this.lastApiRequestTime && retryAttempt === 0) {
+			const now = Date.now()
+			const timeSinceLastRequest = now - this.lastApiRequestTime
+			const rateLimit = rateLimitSeconds || 0
+			const rateLimitDelay = Math.max(0, rateLimit * 1000 - timeSinceLastRequest)
+			finalDelay = rateLimitDelay
+		}
+
+		if (finalDelay > 0) {
+			// Show countdown timer for rate limiting
+			for (let i = Math.ceil(finalDelay / 1000); i > 0; i--) {
+				await this.say("api_req_retry_delayed", `Rate limiting for ${i} seconds...`, undefined, true)
+				await delay(1000)
+			}
+		}
+
+		// Update last request time before making the request
+		this.lastApiRequestTime = Date.now()
+
 		// Wait for MCP servers to be connected before generating system prompt
 		await pWaitFor(() => this.providerRef.deref()?.mcpHub?.isConnecting !== true, { timeout: 10_000 }).catch(() => {
 			console.error("MCP servers failed to connect in time")
@@ -1442,20 +1480,59 @@ export class Cline {
 					}
 				}
 
-				const errorMessage = this.formatErrorWithStatusCode(error)
-
-				const { response } = await this.ask("api_req_failed", errorMessage)
-
-				if (response !== "yesButtonClicked") {
-					// this will never happen since if noButtonClicked, we will clear current task, aborting this instance
-					throw new Error("API request failed")
+				// note that this api_req_failed ask is unique in that we only present this option if the api hasn't streamed any content yet (ie it fails on the first chunk due), as it would allow them to hit a retry button. However if the api failed mid-stream, it could be in any arbitrary state where some tools may have executed, so that error is handled differently and requires cancelling the task entirely.
+				if (retryAttempt >= MAX_RETRIES) {
+					throw new Error(
+						`Maximum retry attempts (${MAX_RETRIES}) reached. Please check your network connection or Resume Task.`,
+					)
 				}
 
-				await this.say("api_req_retried")
+				const errorMsg = error.message ?? "Unknown error"
+				let shouldRetry = false
+				let alwaysApproveResubmit = true
+				if (alwaysApproveResubmit) {
+					shouldRetry = true
+				} else {
+					const { response } = await this.ask(
+						"api_req_failed",
+						error.message ?? JSON.stringify(serializeError(error), null, 2),
+					)
+					shouldRetry = response === "yesButtonClicked"
+					if (!shouldRetry) {
+						throw new Error("API request failed")
+					}
+					await this.say("api_req_retried")
+				}
+
+				if (shouldRetry) {
+					const retryDelays = [3, 5, 10, 20, 30]
+					const retryDelay = retryDelays[retryAttempt]
+
+					// Show countdown timer with fixed backoff
+					for (let i = retryDelay; i > 0; i--) {
+						await this.say(
+							"api_req_retry_delayed",
+							`${errorMsg}\n\nRetry ${retryAttempt + 1} of ${MAX_RETRIES}\nRetrying in ${i} seconds...`,
+							undefined,
+							true,
+						)
+						await delay(1000)
+					}
+
+					await this.say(
+						"api_req_retry_delayed",
+						`${errorMsg}\n\nRetry ${retryAttempt + 1} of ${MAX_RETRIES}\nRetrying now...`,
+						undefined,
+						false,
+					)
+
+					this.lastApiRequestTime = 0
+
+					// delegate generator output from the recursive call with incremented retry count
+					yield* this.attemptApiRequest(previousApiReqIndex, retryAttempt + 1)
+					return
+				}
 			}
-			// delegate generator output from the recursive call
-			yield* this.attemptApiRequest(previousApiReqIndex)
-			return
 		}
 
 		// no error, so we can continue to yield all remaining chunks
