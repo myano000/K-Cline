@@ -74,10 +74,6 @@ export interface ApiHandlerOptions {
 
 export type ApiConfiguration = ApiHandlerOptions & {
 	apiProvider?: ApiProvider
-	maxRetries?: number
-	baseDelay?: number
-	maxDelay?: number
-	retryAllErrors?: boolean
 }
 
 // Models
