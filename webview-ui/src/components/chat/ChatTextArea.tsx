@@ -411,7 +411,7 @@ const ChatTextArea = forwardRef<HTMLTextAreaElement, ChatTextAreaProps>(
 				}
 
 				const isComposing = event.nativeEvent?.isComposing ?? false
-				if (event.key === "Enter" && !event.shiftKey && !isComposing) {
+				if (event.key === "Enter" && event.ctrlKey && !event.shiftKey && !isComposing) {
 					event.preventDefault()
 					setIsTextAreaFocused(false)
 					onSend()
